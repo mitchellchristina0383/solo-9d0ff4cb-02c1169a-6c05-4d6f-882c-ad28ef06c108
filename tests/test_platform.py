@@ -353,3 +353,209 @@ async def test_07_recovery_revokes_stale_load_then_confirms_release(client):
     r2 = await client.post("/api/deployments", json={
         "model_name": "new-tenant", "mem_per_replica_mb": 7000, "replica_count": 1})
     assert r2.status_code == 201, r2.text
+
+
+def sim_state(client, node_id):
+    t = client._transport  # type: ignore[attr-defined]
+    return (t._a if node_id == "node-a" else t._b).app.state
+
+
+@pytest.mark.asyncio
+async def test_08_reset_releases_single_replica_then_retry(client):
+    # 单副本部署可用后，值班员重置承载节点：
+    # 转待核 -> 重置 -> 核实无残留 -> 释放显存 -> 失败可重试
+    r = await client.post("/api/deployments", json={
+        "model_name": "solo", "mem_per_replica_mb": 2048, "replica_count": 1})
+    dep_id = r.json()["id"]
+    dep = await wait_for(client, dep_id, {"AVAILABLE"})
+    node_id = dep["replicas"][0]["node_id"]
+    rid = dep["replicas"][0]["id"]
+
+    rr = await client.post(f"/api/nodes/{node_id}/reset")
+    assert rr.status_code == 200, rr.text
+    body = rr.json()
+    assert body["reset"] is True and body["affected_replicas"] == 1
+    assert any("无残留" in n for n in body["notes"])
+
+    # 部署失败可重试，副本确认释放，显存全额回收
+    dep = await wait_for(client, dep_id, {"FAILED"})
+    rep = dep["replicas"][0]
+    assert rep["status"] == "RELEASED" and rep["released_at"]
+    book = (await client.get("/api/nodes")).json()
+    assert node_free(book, node_id) == 8192
+    # 节点侧无任何残留记录
+    assert sim_state(client, node_id).replicas == {}
+    # 事件流水：部署维度可见 转待核 -> 核实释放；节点级 RESET_OK 在全局事件流
+    types = [e["event_type"] for e in dep["events"]]
+    assert "RESET_MARK" in types and "RESET_RELEASED" in types
+    all_events = (await client.get("/api/events?limit=50")).json()
+    assert any(e["event_type"] == "RESET_OK" and e["node_id"] == node_id
+               for e in all_events)
+
+    # 失败可重试：新 epoch 重新调度成功，旧副本保持终态不复活
+    r2 = await client.post(f"/api/deployments/{dep_id}/retry")
+    assert r2.status_code == 200
+    dep2 = await wait_for(client, dep_id, {"AVAILABLE"})
+    assert dep2["epoch"] == 2
+    old = [x for x in dep2["replicas"] if x["epoch"] == 1]
+    assert old[0]["id"] == rid and old[0]["status"] == "RELEASED"
+
+
+@pytest.mark.asyncio
+async def test_09_reset_interleaved_with_inflight_load(client):
+    # 加载在途（节点侧已受理、尚未落地）时发起重置：
+    # 旧请求不得重新加载，旧加载不得在重置后落地，状态不得复活
+    await client.post("/api/nodes/node-a/control", json={"load_delay": 2.0})
+    r = await client.post("/api/deployments", json={
+        "model_name": "inflight", "mem_per_replica_mb": 1024, "replica_count": 1})
+    dep_id = r.json()["id"]
+
+    # 立即重置：与“下发加载/节点受理/落地”任意交错
+    rr = await client.post("/api/nodes/node-a/reset")
+    assert rr.status_code == 200, rr.text
+
+    # 终态必须失败可重试且显存全额回收
+    dep = await wait_for(client, dep_id, {"FAILED"}, timeout=15)
+    assert all(x["status"] in {"RELEASED", "LOAD_FAILED"} for x in dep["replicas"])
+    book = (await client.get("/api/nodes")).json()
+    assert node_free(book, "node-a") == 8192
+
+    # 等过原加载延迟：旧加载不得在重置后落地（节点侧不得出现 loaded/loading）
+    await asyncio.sleep(2.5)
+    leftovers = sim_state(client, "node-a").replicas.values()
+    assert not any(rec["status"] in {"loaded", "loading"} for rec in leftovers), leftovers
+    # 重置后节点控制面恢复默认
+    assert sim_state(client, "node-a").control["load_delay"] != 2.0
+
+
+@pytest.mark.asyncio
+async def test_10_reset_result_unknown_keeps_hold_then_reconcile_restores(client):
+    # 重置结果不明：保持待核与占用；确认原副本仍在且重置未生效后才恢复可用
+    r = await client.post("/api/deployments", json={
+        "model_name": "keep", "mem_per_replica_mb": 1024, "replica_count": 1})
+    dep_id = r.json()["id"]
+    dep = await wait_for(client, dep_id, {"AVAILABLE"})
+    node_id = dep["replicas"][0]["node_id"]
+
+    # 模拟重置指令得到显式故障响应（非传输错误，不触发失联联动与自动对账）
+    from app import node_client as nc
+    orig_reset = nc.reset
+
+    async def bad_reset(base_url):
+        return nc.CallResult(False, 500, error="重置被节点拒绝(HTTP 500)：演练")
+
+    nc.reset = bad_reset
+    try:
+        rr = await client.post(f"/api/nodes/{node_id}/reset")
+        assert rr.status_code == 502
+        assert "待核" in rr.json()["detail"]
+    finally:
+        nc.reset = orig_reset
+
+    # 部署保持待核，显存继续占用，不得擅自释放
+    dep = (await client.get(f"/api/deployments/{dep_id}")).json()
+    assert dep["status"] == "UNVERIFIED"
+    assert dep["replicas"][0]["status"] == "UNVERIFIED"
+    book = (await client.get("/api/nodes")).json()
+    assert node_free(book, node_id) == 8192 - 1024
+
+    # 重置实际未生效、原副本仍在：对账确认后恢复可用
+    rec = (await client.post(f"/api/deployments/{dep_id}/reconcile")).json()
+    assert rec["status"] == "AVAILABLE"
+    dep = (await client.get(f"/api/deployments/{dep_id}")).json()
+    assert dep["replicas"][0]["status"] == "LOADED"
+    book = (await client.get("/api/nodes")).json()
+    assert node_free(book, node_id) == 8192 - 1024  # 恢复可用后占用保持
+
+
+@pytest.mark.asyncio
+async def test_11_repeated_reset_does_not_double_release(client):
+    r = await client.post("/api/deployments", json={
+        "model_name": "once", "mem_per_replica_mb": 1024, "replica_count": 1})
+    dep_id = r.json()["id"]
+    dep = await wait_for(client, dep_id, {"AVAILABLE"})
+    node_id = dep["replicas"][0]["node_id"]
+    rid = dep["replicas"][0]["id"]
+
+    r1 = await client.post(f"/api/nodes/{node_id}/reset")
+    assert r1.status_code == 200
+    dep = await wait_for(client, dep_id, {"FAILED"})
+    released_at = dep["replicas"][0]["released_at"]
+
+    # 重复重置：无受影响副本，不重复释放、不改写终态
+    r2 = await client.post(f"/api/nodes/{node_id}/reset")
+    assert r2.status_code == 200
+    assert r2.json()["affected_replicas"] == 0
+    dep2 = (await client.get(f"/api/deployments/{dep_id}")).json()
+    rep2 = dep2["replicas"][0]
+    assert rep2["status"] == "RELEASED"
+    assert rep2["released_at"] == released_at
+    n = sum(1 for e in dep2["events"]
+            if e["event_type"] == "RESET_RELEASED" and e["replica_id"] == rid)
+    assert n == 1
+    book = (await client.get("/api/nodes")).json()
+    assert node_free(book, node_id) == 8192
+
+
+@pytest.mark.asyncio
+async def test_12_reset_only_affects_deployments_on_that_node(client):
+    # dep_a：单副本落在 node-a；dep_shared：双副本分处 A/B
+    r = await client.post("/api/deployments", json={
+        "model_name": "on-a", "mem_per_replica_mb": 1024, "replica_count": 1})
+    dep_a = r.json()["id"]
+    dep_a_d = await wait_for(client, dep_a, {"AVAILABLE"})
+    assert dep_a_d["replicas"][0]["node_id"] == "node-a"
+
+    r = await client.post("/api/deployments", json={
+        "model_name": "shared", "mem_per_replica_mb": 2048, "replica_count": 2})
+    dep_shared = r.json()["id"]
+    await wait_for(client, dep_shared, {"AVAILABLE"})
+
+    # 重置 node-b：只影响 shared 在 B 上的副本，其余一律不变
+    rr = await client.post("/api/nodes/node-b/reset")
+    assert rr.status_code == 200
+    assert rr.json()["affected_replicas"] == 1
+
+    dep_shared_d = await wait_for(client, dep_shared, {"FAILED"})
+    by_node = {x["node_id"]: x for x in dep_shared_d["replicas"]}
+    assert by_node["node-b"]["status"] == "RELEASED"
+    assert by_node["node-a"]["status"] == "LOADED"  # 其他节点副本不变
+
+    dep_a_d = (await client.get(f"/api/deployments/{dep_a}")).json()
+    assert dep_a_d["status"] == "AVAILABLE"  # 其他节点的部署不变
+    assert dep_a_d["replicas"][0]["status"] == "LOADED"
+    assert not any(e["event_type"].startswith("RESET") for e in dep_a_d["events"])
+
+    book = (await client.get("/api/nodes")).json()
+    assert node_free(book, "node-b") == 8192
+    assert node_free(book, "node-a") == 8192 - 1024 - 2048
+
+
+@pytest.mark.asyncio
+async def test_13_reset_interleaved_with_releasing(client):
+    # 副本已转释放中（撤销在途、节点失联未确认）时发起重置：
+    # 重置与撤销交错，最终确认无残留才释放，不复活、不重复释放
+    await client.post("/api/nodes/node-a/control", json={"mode": "unreachable"})
+    r = await client.post("/api/deployments", json={
+        "model_name": "rls", "mem_per_replica_mb": 1024, "replica_count": 1})
+    dep_id = r.json()["id"]
+    dep = await wait_for(client, dep_id, {"UNVERIFIED"}, timeout=10)
+    rid = dep["replicas"][0]["id"]
+
+    await service.request_release(rid, "演练：撤销旧加载")
+    dep = (await client.get(f"/api/deployments/{dep_id}")).json()
+    assert dep["replicas"][0]["status"] == "RELEASING"
+
+    # 重置走带外控制通道（失联模式下仍可达），同时清除故障模式
+    rr = await client.post("/api/nodes/node-a/reset")
+    assert rr.status_code == 200, rr.text
+    dep = await wait_for(client, dep_id, {"FAILED"})
+    rep = dep["replicas"][0]
+    assert rep["status"] == "RELEASED"
+    book = (await client.get("/api/nodes")).json()
+    assert node_free(book, "node-a") == 8192
+    assert sim_state(client, "node-a").control["mode"] == "normal"
+    # 终态稳定：再对账也不会复活或改写
+    await client.post(f"/api/deployments/{dep_id}/reconcile")
+    dep = (await client.get(f"/api/deployments/{dep_id}")).json()
+    assert dep["replicas"][0]["status"] == "RELEASED"

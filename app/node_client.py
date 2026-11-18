@@ -107,6 +107,28 @@ async def unload(base_url: str, model_name: str, replica_id: str, epoch: int) ->
                           error=f"连接失败（保持释放中，待对账确认）: {exc.__class__.__name__}")
 
 
+async def reset(base_url: str) -> CallResult:
+    """整机重置。传输层失败 => 重置结果不明，调用方必须保留占用待核。"""
+    try:
+        c = await client()
+        r = await c.post(f"{base_url}/reset")
+        if r.status_code == 200:
+            return CallResult(True, 200, r.json())
+        detail = ""
+        try:
+            detail = r.json().get("detail", "")
+        except Exception:
+            detail = r.text[:200]
+        return CallResult(False, r.status_code,
+                          error=f"重置被节点拒绝(HTTP {r.status_code}): {detail}")
+    except httpx.TimeoutException:
+        return CallResult(False, timed_out=True,
+                          error="重置调用超时，重置是否生效未知（保留占用待核）")
+    except (httpx.HTTPError, OSError) as exc:
+        return CallResult(False, connect_error=True,
+                          error=f"重置连接失败（结果不明，保留占用待核）: {exc.__class__.__name__}")
+
+
 async def query_replica(base_url: str, replica_id: str, epoch: int) -> CallResult:
     try:
         c = await client()

@@ -148,7 +148,7 @@ function renderFaults(nodes){
       <button class="danger" onclick="setControl('${n.node_id}',{mode:'unreachable'})">模拟失联</button>
       <button class="ghost" onclick="setControl('${n.node_id}',{load_fail:true})">下次加载失败</button>
       <button class="ghost" onclick="setControl('${n.node_id}',{load_fail:false,ack_delay:4})">迟到回执4s</button>
-      <button class="ghost" onclick="resetNode('${n.node_id}')">重置节点</button>
+      <button class="ghost" title="整机重置：相关部署先转待核，核实无残留后释放显存" onclick="resetNode('${n.node_id}')">重置节点</button>
     </div>`).join('');
 }
 async function setControl(id, body){
@@ -157,8 +157,10 @@ async function setControl(id, body){
   catch(e){ toast(e.message,true); }
 }
 async function resetNode(id){
-  try{ await api(`/api/nodes/${id}/reset`,{method:'POST'}); toast('节点已重置 '+id); refresh(); }
-  catch(e){ toast(e.message,true); }
+  if(!confirm('重置节点 '+id+'？\n该节点上占用显存的部署将先转「待核」，重置成功并核实无残留后才释放显存、标记为失败可重试。')) return;
+  try{ const r = await api(`/api/nodes/${id}/reset`,{method:'POST'});
+       (r.notes||['节点已重置 '+id]).forEach(n=>toast(n)); refresh(); }
+  catch(e){ toast(e.message,true); refresh(); }
 }
 
 const DEP_BADGE={AVAILABLE:'success',FAILED:'danger',UNVERIFIED:'warning',PENDING:'info'};

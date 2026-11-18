@@ -261,6 +261,11 @@ async def _load_replica(rid: str) -> None:
     node = config.NODE_MAP[rep["node_id"]]
 
     with db.tx() as conn:
+        # 事务内重查：若副本已被重置/对账/重试接管（状态或 epoch 已变），
+        # 本次旧请求不得再下发加载
+        cur = conn.execute("SELECT status,epoch FROM replicas WHERE id=?", (rid,)).fetchone()
+        if not cur or cur["status"] != models.REP_PENDING or cur["epoch"] != rep["epoch"]:
+            return
         _set_replica(conn, rid, models.REP_LOADING)
         log_event(conn, "LOAD_SEND", f"向 {node.name} 下发加载 {dep['model_name']}（epoch={rep['epoch']}）",
                   dep["id"], rid, node.node_id)
@@ -352,7 +357,11 @@ async def request_release(rid: str, reason: str) -> None:
     node = config.NODE_MAP[rep["node_id"]]
 
     with db.tx() as conn:
-        if rep["status"] != models.REP_RELEASING:
+        # 事务内重查：已终态（已释放/明确失败）的副本不得复活，也不重复发起释放
+        cur = conn.execute("SELECT status FROM replicas WHERE id=?", (rid,)).fetchone()
+        if not cur or cur["status"] in (models.REP_RELEASED, models.REP_LOAD_FAILED):
+            return
+        if cur["status"] != models.REP_RELEASING:
             _set_replica(conn, rid, models.REP_RELEASING, error=reason)
             log_event(conn, "RELEASE_SEND", f"请求 {node.name} 撤销旧加载：{reason}",
                       dep["id"], rid, node.node_id)
@@ -458,16 +467,18 @@ async def reconcile(dep_id: str) -> dict:
                     notes.append(f"{node.name} 对账不一致，副本转待核并将撤销")
                     log_event(conn, "RECONCILE_MISMATCH", "账本已加载但节点无此副本",
                               dep_id, cur["id"], node.node_id)
-                else:  # PENDING/LOADING
+                elif st in (models.REP_PENDING, models.REP_LOADING):
                     _set_replica(conn, cur["id"], models.REP_LOAD_FAILED,
                                  error="对账发现节点无此副本，加载未生效", released=True)
                     notes.append(f"{node.name} 无此副本，判定加载失败")
                     log_event(conn, "RECONCILE_MISSING", "加载未生效",
                               dep_id, cur["id"], node.node_id)
+                # 其余为终态（RELEASED/LOAD_FAILED）：并发对账/重复重置下不改写、不重复释放
             elif remote == "failed":
-                _set_replica(conn, cur["id"], models.REP_LOAD_FAILED,
-                             error="节点上报 failed", released=True)
-                notes.append(f"{node.name} 上报失败，释放预留")
+                if st not in (models.REP_RELEASED, models.REP_LOAD_FAILED):
+                    _set_replica(conn, cur["id"], models.REP_LOAD_FAILED,
+                                 error="节点上报 failed", released=True)
+                    notes.append(f"{node.name} 上报失败，释放预留")
             else:  # loading / unloading
                 if st == models.REP_TIMEOUT:
                     # 节点仍在加载：给一次确认机会，维持等待，下轮轮询继续核实
@@ -486,6 +497,130 @@ async def reconcile(dep_id: str) -> dict:
     updated = get_deployment(dep_id)
     updated["reconcile_notes"] = notes or ["所有副本与节点状态一致"]
     return updated
+
+
+# ---------------------------------------------------------------- 节点重置对账
+async def reset_node(node_id: str) -> dict:
+    """值班员整机重置：先转待核，再下发重置，成功后逐副本核实处置。
+
+    时序与不变式：
+    1) 发起重置即把本节点所有仍占显存的副本转 UNVERIFIED（保留占用），
+       相关部署联动待核 —— 此后加载/撤销/轮询的迟到结果都会被状态守卫丢弃；
+    2) 重置结果不明（传输失败/显式拒绝）：保持待核与占用，绝不擅自释放；
+    3) 重置成功后逐副本核实：节点无残留（旧加载不会再落地）才释放预留，
+       部署转 FAILED 可重试；副本仍在（重置未生效/加载在重置后完成）则恢复可用；
+       旧加载仍在途则转 RELEASING 撤销，确认释放后才回收显存；
+    4) 全部状态迁移都有事务内守卫，重复重置/并发对账不会重复释放。
+    """
+    node = config.NODE_MAP.get(node_id)
+    if not node:
+        raise HTTPException(404, "节点不存在")
+
+    # 1) 发起重置：本节点上仍占显存的副本一律转待核（保留占用），部署联动待核
+    with db.tx() as conn:
+        reps = conn.execute(
+            "SELECT * FROM replicas WHERE node_id=? AND status IN (%s)"
+            % ",".join("?" * len(config.RESERVED_STATUSES)),
+            (node_id, *config.RESERVED_STATUSES),
+        ).fetchall()
+        affected = [dict(r) for r in reps]
+        dep_ids = set()
+        for r in affected:
+            _set_replica(conn, r["id"], models.REP_UNVERIFIED,
+                         error="节点重置：待核实旧加载已清空且不会再落地")
+            log_event(conn, "RESET_MARK",
+                      f"值班员重置 {node.name}，副本转待核（显存保留占用）",
+                      r["deployment_id"], r["id"], node_id)
+            dep_ids.add(r["deployment_id"])
+        for dep_id in dep_ids:
+            _evaluate(conn, dep_id)
+
+    # 2) 下发重置；结果不明则保持待核，由恢复后的自动/手动对账处置
+    result = await node_client.reset(node.base_url)
+    if not result.ok:
+        with db.tx() as conn:
+            log_event(conn, "RESET_UNKNOWN",
+                      f"{node.name} 重置结果不明：{result.error}；"
+                      f"相关副本保持待核并保留占用，恢复后需对账核实",
+                      node_id=node_id)
+        if result.transport_failed:
+            mark_node_lost(node_id, result.error)
+        raise HTTPException(
+            502, f"重置结果不明：{result.error}；相关部署已转待核并保留显存占用，"
+                 f"请待节点恢复后手动对账")
+
+    mark_node_online(node_id)
+    with db.tx() as conn:
+        log_event(conn, "RESET_OK",
+                  f"{node.name} 重置成功，逐副本核实旧加载与残留", node_id=node_id)
+
+    # 3) 逐副本核实：无残留才释放；副本仍在则恢复；在途旧加载先撤销
+    notes: list[str] = []
+    for r in affected:
+        dep_id = r["deployment_id"]
+        cur = db.query_one("SELECT * FROM replicas WHERE id=?", (r["id"],))
+        if not cur or cur["status"] != models.REP_UNVERIFIED:
+            continue  # 已被并发对账/重复重置处置，不重复处理
+        q = await node_client.query_replica(node.base_url, cur["id"], cur["epoch"])
+        with db.tx() as conn:
+            cur = conn.execute("SELECT * FROM replicas WHERE id=?", (r["id"],)).fetchone()
+            if not cur or cur["status"] != models.REP_UNVERIFIED:
+                continue
+            if q.transport_failed:
+                mark_node_lost(node_id, q.error)
+                note = (f"{node.name} 重置后核实失败（{q.error}），"
+                        f"副本 {cur['id']} 保持待核并保留占用")
+                notes.append(note)
+                log_event(conn, "RESET_VERIFY_BLOCKED", note, dep_id, cur["id"], node_id)
+                continue
+            remote = (q.data or {}).get("status")
+            if remote in ("unknown", "unloaded"):
+                # 节点无残留：重置已清空记录且落地任务已取消，旧加载不会再落地
+                _set_replica(conn, cur["id"], models.REP_RELEASED,
+                             error=f"重置后核实节点无残留（remote={remote}），旧加载不会再落地",
+                             released=True)
+                notes.append(f"副本 {cur['id']} 核实无残留，释放 {cur['mem_mb']}MB，可重试")
+                log_event(conn, "RESET_RELEASED",
+                          "重置后核实无残留，释放显存", dep_id, cur["id"], node_id)
+            elif remote == "loaded":
+                # 副本仍在：重置未生效或加载在重置后完成，账本与节点一致，恢复可用
+                _set_replica(conn, cur["id"], models.REP_LOADED, confirmed=True)
+                notes.append(f"副本 {cur['id']} 在节点上仍已加载，恢复可用")
+                log_event(conn, "RESET_STILL_LOADED",
+                          "重置后副本仍在节点上，恢复已加载", dep_id, cur["id"], node_id)
+            elif remote == "loading":
+                # 旧加载在途、随后会落地：先转释放中并撤销，确认释放后才回收显存
+                _set_replica(conn, cur["id"], models.REP_RELEASING,
+                             error="重置后旧加载仍在途，撤销并等待确认释放")
+                notes.append(f"副本 {cur['id']} 旧加载仍在途，已转撤销")
+                log_event(conn, "RESET_INFLIGHT",
+                          "旧加载在途，转释放中并撤销", dep_id, cur["id"], node_id)
+            elif remote == "failed":
+                _set_replica(conn, cur["id"], models.REP_LOAD_FAILED,
+                             error="节点上报加载失败", released=True)
+                notes.append(f"副本 {cur['id']} 节点上报失败，释放预留")
+                log_event(conn, "RESET_LOAD_FAILED",
+                          "节点上报加载失败，释放预留", dep_id, cur["id"], node_id)
+            else:  # unloading 等中间态：保持待核，下轮对账继续核实
+                notes.append(f"副本 {cur['id']} 节点状态为 {remote}，保持待核")
+                log_event(conn, "RESET_VERIFY_PENDING",
+                          f"节点状态 {remote}，保持待核", dep_id, cur["id"], node_id)
+                continue
+            _evaluate(conn, dep_id)
+
+    # 4) 在途旧加载统一撤销（幂等），由 poll_releasing 确认释放
+    for r in db.query(
+        "SELECT id FROM replicas WHERE node_id=? AND status=?",
+        (node_id, models.REP_RELEASING),
+    ):
+        await request_release(r["id"], "重置后撤销在途旧加载")
+
+    return {
+        "node_id": node_id,
+        "reset": True,
+        "affected_replicas": len(affected),
+        "notes": notes or ["本节点无占用中的副本，已直接重置"],
+    }
 
 
 # ---------------------------------------------------------------- 重试

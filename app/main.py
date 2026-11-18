@@ -126,12 +126,7 @@ async def node_control(node_id: str, body: ControlBody):
 
 @app.post("/api/nodes/{node_id}/reset")
 async def node_reset(node_id: str):
+    """整机重置：相关部署先转待核，重置成功并核实无残留后才释放显存。"""
     if node_id not in config.NODE_MAP:
         raise HTTPException(404, "节点不存在")
-    url = config.NODE_MAP[node_id].base_url + "/reset"
-    try:
-        c = await node_client.client()
-        r = await c.post(url)
-        return r.json()
-    except httpx.HTTPError as exc:
-        raise HTTPException(502, f"重置指令送达失败：{exc.__class__.__name__}")
+    return await service.reset_node(node_id)

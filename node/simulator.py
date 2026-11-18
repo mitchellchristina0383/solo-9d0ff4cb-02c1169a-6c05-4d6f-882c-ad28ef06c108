@@ -6,6 +6,8 @@
 - 故障模式：normal / slow（高延迟）/ fail（HTTP 503 故障）/ unreachable（超时失联）
 - load_fail：加载请求直接返回 500
 - 每条副本记录带 epoch，旧 epoch 的迟到回调不会覆盖新状态（防复活）
+- /reset 模拟整机重置：取消在途落地/卸载任务并清空全部副本记录，
+  在途加载的回执改判 410（加载未生效），防止旧请求在重置后落地
 """
 from __future__ import annotations
 
@@ -137,6 +139,14 @@ def create_app(
         }
         schedule(control["load_delay"], finish_load(rid, epoch, control["load_delay"]))
         await asyncio.sleep(control["ack_delay"])
+        rec = replicas.get(rid)
+        if not rec or rec["epoch"] != epoch:
+            # 回执在途期间节点被重置：记录已清空、落地任务已取消，本次加载不会生效，
+            # 必须明确告知未受理，而不是谎报 202（迟到回执不得复活旧加载）
+            return JSONResponse(
+                {"detail": "加载在途期间节点已重置，本次加载未生效", "replica": rid},
+                status_code=410,
+            )
         return JSONResponse(
             {"replica": rid, "epoch": epoch, "status": "loading"}, status_code=202
         )
@@ -179,6 +189,10 @@ def create_app(
 
     @app.post("/reset")
     async def reset():
+        # 先取消所有在途的落地/卸载任务，再清空记录：
+        # 保证重置成功后旧加载不会再落地（finish_load 即便漏网也会因记录不存在而空转）
+        for t in list(tasks):
+            t.cancel()
         replicas.clear()
         control.update(
             mode="normal",
